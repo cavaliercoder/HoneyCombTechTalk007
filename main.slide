@@ -1,0 +1,447 @@
+Event driven configuration
+w/ AWS Lambda
+
+16 May 2018
+
+Ryan Armstrong
+
+ryan@cavaliercoder.com
+http://cavaliercoder.com/
+https://github.com/cavaliercoder/
+@cavaliercoder
+
+* About me
+
+- Currently, SRE @ Dropbox
+- Moved from Australia in Feb 2018
+- Married 12y, 1x 10yo girl, 1x F. Rottweiler
+- Reads comic books
+- Slaps a little bass
+- Writing Sega Genesis emulator in Go
+- Responds well to audience interaction
+
+* Agenda
+
+Let's think about guarantees and trade-offs in AWS.
+
+Aimed at first-time FaaS users.
+
+- Problem statement
+- AWS Lambda 101
+- Apply AWS Lambda
+- Fix broken stuff
+- Questions
+
+* Problem statement
+
+- Hundreds of ephemeral EC2 instances
+- Tens of server roles
+- Monitoring tool not integrated with AWS
+
+.image images/thewest.png 640 _
+
+* About Zabbix
+
+.image images/zabbix_screen.png 800 _
+
+: explain Zabbix architecture
+
+- Great point-in-time metrics
+- Expressive alarms
+- Low sample rate
+- Poor aggregations
+- All in one (monolith)
+- Powerful API
+
+: My history with Zabbix
+: Next: how do we register instances?
+
+* Option 1: Agent self registration approach
+
+Pattern matching:
+
+    $ uname -a
+    Linux i-deadbeef 4.13.0-38-generic #43~16.04.1-Ubuntu SMP Wed Mar 14 17:48:43 UTC 2018 x86_64 x86_64 x86_64 GNU/Linux
+
+- No metadata like EC2 Tags
+- No deregistration
+- No alarms for failed-boot instances
+- No alarms for unreachable instances
+
+* Option 2: Batch sync
+
+    # update monitoring config hourly
+    0 * * * * /usr/local/bin/zabbix_sync.py
+
+    # pseudo code
+    for instance in get_ec2_instances():
+      if not get_zabbix_instance(instance.id):
+        upsert_zabbix_instance(instance)
+
+- Scales poorly
+- Slow (single threaded)
+- Unnecessary load + RSS
+
+Worse...
+
+- Terminated hosts throw alarms
+- Delayed monitoring for new instances
+
+: Made sense in Datacenter with no event API and persistent hosts.
+
+* Option 3: FaaS
+
+Functions-as-a-Service with AWS Lambda
+
+- Triggered on instance start and termination
+- Scope of diff is limited to effected instance/s
+- As a service
+
+.image images/aws-lambda.png 1024 _
+
+* AWS Lambda 101
+
+Plz RTFM (IAM, VPC, etc.)
+
+Run Python function when an event happens in AWS EC2.
+
+    # lambda.py
+    def hello_world_handler(event, context):
+        """
+        A simple Lambda Handler.
+        """
+
+        return {
+          'message': 'Hello world!',
+        }
+
+: event is the request payload
+: context includes: request id, time remaining, log group, etc.
+
+
+* AWS Lambda 101
+
+Package for deployment
+
+    # install dependencies to cwd
+    $ pip install --target=. [package, ...]
+
+    # create self-contained zip file
+    zip lambda.zip \
+        lambda.py \
+        [package]/*.py
+
+* AWS Lambda 101
+
+Ship it!
+
+    # deploy via AWS CLI
+    aws lambda create-function \
+        --function-name=HelloWorld \
+        --runtime=python2.7 \
+        --handler=lambda.hello_world_handler \
+        --zip-file=file://lambdas.zip \
+        ...
+
+.image images/shipit.jpg 400 _
+
+* AWS Lambda 101
+
+Run it!
+
+    # invoke via AWS CLI
+    $ aws lambda invoke \
+        --function-name=HelloWorld \
+        -
+    {
+      "message": "Hello world!"
+    }
+
+Stdout/Logs → CloudWatch
+
+* AWS Lambda 101
+
+Invoking Lambda
+
+Event sources:
+
+- Amazon S3
+- Amazon DynamoDB
+- Amazon Kinesis Data Streams
+- Amazon Simple Notification Service
+- Amazon CloudWatch Events
+- Etc.
+
+Scheduled events (CloudWatch)
+
+Custom invocations
+
+* Apply AWS Lambda
+
+- Create a Lambda function to configure Zabbix
+- Subscribe to CloudWatch events
+- Draft presentation for Meetup
+
+* Create Lambda
+
+    # zabbix.py pseudo-code
+    def state_change_handler(event, context):
+        """
+        Configure Zabbix when an EC2 instance changes state.
+        """
+
+        instanceid = event['details']['instance-id']
+        state = event['details']['state']
+
+        if state in ('pending', 'running'):
+            return upsert_zabbix_host(instanceid)
+
+        if state == 'terminated':
+            return archive_zabbix_host(instanceid)
+
+        # some other state
+        return {
+          'message': 'No-op',
+        }
+
+* Subscribing to EC2 Events
+
+- Create a CloudWatch Events rule
+- Event source: Event pattern
+
+    {
+      "source": [ "aws.ec2" ],
+      "detail-type": [ "EC2 Instance State-change Notification" ]
+    }
+
+- Target: Lambda function
+
+Event:
+
+    {
+      "detail": {
+        "instance-id": "i-deadbeef",
+        "state": "pending"
+      },
+      ...
+    }
+
+https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceState.html
+
+* Apply AWS Lambda
+
+Now:
+- On start: monitored for boot issues and reachability!
+- On termination: Alarms suppressed, capacity released!
+
+* Problem: Missing instances
+
+We turn up hundreds of hosts daily, all at once!
+
+- Fan out of Lambda "workers"
+- Saturation of PHP API
+- Guarantees?
+
+: Run at least once?
+: No guarantee of successful invocation
+
+* Problem: Missing instances
+
+We need:
+
+- Constrained concurrency
+- Automatic retry + back-off
+- Alarm on failure
+- Reconcile drift
+
+* Reconcile drift
+
+Use scheduled batch-sync!!!
+
+- Limit throughput, run less frequent
+- Re-use API mappings.
+- Delayed sync, but covers edge cases
+
+    # update monitoring config hourly
+    0 * * * * /usr/local/bin/zabbix_sync.py
+
+    # pseudo code
+    for instance in get_ec2_instances():
+      if not get_zabbix_instance(instance.id):
+        upsert_zabbix_instance(instance)
+
+* Alarms on failure
+
+Lambda errors log to CloudWatch
+
+Trigger on error!
+
+What about Events that never invoke Lambda?
+
+* Constrained concurrency
+
+Two options:
+
+- Use a global lock/semaphore (DynamoDB?)
+- Use a serialized work queue (S3? SQS? Kinesis?)
+
+Option 2 could simplify retry/back-off
+
+: What are our options for constrained concurrency with retry/back-off
+
+* Constrained concurrency
+
+Serialize via SQS Queue?
+
+CloudWatch Event Rule → SQS Queue → Lambda
+
+- Requeue messages for retry
+- Persist failed messages in dead-letter queue
+
+Lambda:
+- Take a global lock (DynamoDB?)
+- Flush the Queue
+- Release lock
+
+* Constrained concurrency
+
+Serialize via SQS Queue?
+
+No event source for SQS 😭
+
+.image images/no.jpg 200 _
+
+* Constrained concurrency
+
+Serialize via SQS Queue?
+
+CloudWatch scheduled events?
+
+- Trigger every minute
+- Minor delays
+- Most invocations no-op
+- +Complexity
+
+* Constrained concurrency
+
+Serialize via SQS Queue?
+
+Subscribe Lambda to SNS Topic?
+
+CloudWatch Event Rule → SNS Topic → SQS Queue
+                                  → Lambda invocation
+
+- Reduced delay
+- Global lock required
+- No guaranteed delivery
+- +Complexity
+
+
+* Constrained concurrency
+
+Serialize via Kinesis Streams?
+
+- One consumer per shard (no global lock!)
+- Guaranteed delivery (with limited retention)
+- Built-in retry/back-off
+- Errors are blocking...
+
+* Kinesis+Lambda
+
+CloudWatch Event Rule → Kinesis Stream → Lambda
+
+- Publish Lambda Function
+- Create Kinesis Stream w/ shard count
+- Create Event Source Mapping from Kinesis Stream to Lambda Function
+- Create CloudWatch Event Rule with EC2 event source
+- Add Kinesis Stream as an Event Target
+
+.image images/build-it.jpg 400 _
+
+* Kinesis+Lambda
+
+    {
+        "Records": [
+            {
+                "kinesis": {
+                  "data": "<base64_encoded>",
+                  ...
+                },...
+            },...
+        ]
+    }
+
+For each record, data is the EC2 CloudWatch event, encoded as Base64!
+
+* Kinesis+Lambda
+
+    def KinesisStreamHandler(lambda_handler):
+        """
+        Wraps any CloudWatch Event handler with a Kinesis Streams handler.
+        """
+
+        def handler(event, context):
+            from base64 import b64decode
+            from json import loads
+
+            for record in event['Records']:
+                data = b64decode(record['kinesis']['data'])
+                revent = loads(data)
+
+                # call wrapped handler
+                lambda_handler(revent, context)
+
+            return {
+                'message': 'Processed {} records'.format(len(event['Records']))
+            }
+
+        return handler
+
+* Potential issues
+
+What happens when a Lambda fails?
+
+Kinesis will stop progressing and keep retrying until:
+
+- Event processing succeeds or
+- Event is expired
+
+So make sure:
+
+- Get your batch size right!
+- Make your API calls idempotent
+- Consider failing silently
+
+
+* Potential issues
+
+The Instance state in the message might be out of date!
+
+    {
+      "detail": {
+        "instance-id": "i-deadbeef",
+        "state": "pending" # like, 20 minutes ago...
+      },
+      ...
+    }
+
+So...
+
+* Kinesis+Lambda
+
+Always fetch the latest Instance metadata before updating configuration.
+
+    # zabbix.py pseudo-code
+    def state_change_handler(event, context):
+        instance = get_ec2_instance(
+                      event['details']['instance-id']
+                   )
+        state = instance['instanceState']['name']
+        ...
+
+Maybe, raise an alarm if event state is stale.
+
+* Final thoughts
+
+- Ordering?
+- Accidental termination?
