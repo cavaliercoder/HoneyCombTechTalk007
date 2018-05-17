@@ -20,6 +20,8 @@ https://github.com/cavaliercoder/
 - Writing Sega Genesis emulator in Go
 - Responds well to audience interaction
 
+.image images/ryan.jpg 300 _
+
 * Agenda
 
 Let's think about guarantees and trade-offs in AWS.
@@ -180,7 +182,7 @@ Custom invocations
 
 - Create a Lambda function to configure Zabbix
 - Subscribe to CloudWatch events
-- Draft presentation for Meetup
+- Chill like Thanos
 
 * Create Lambda
 
@@ -216,7 +218,7 @@ Custom invocations
 
 - Target: Lambda function
 
-Event:
+Event body:
 
     {
       "detail": {
@@ -226,13 +228,15 @@ Event:
       ...
     }
 
-https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_InstanceState.html
-
 * Apply AWS Lambda
 
 Now:
 - On start: monitored for boot issues and reachability!
 - On termination: Alarms suppressed, capacity released!
+
+.image images/applause.jpg 300 _
+
+: What could go wrong?
 
 * Problem: Missing instances
 
@@ -244,6 +248,8 @@ We turn up hundreds of hosts daily, all at once!
 
 : Run at least once?
 : No guarantee of successful invocation
+
+.image images/thundering-herd.jpg 300 _
 
 * Problem: Missing instances
 
@@ -272,11 +278,8 @@ Use scheduled batch-sync!!!
 
 * Alarms on failure
 
-Lambda errors log to CloudWatch
-
-Trigger on error!
-
-What about Events that never invoke Lambda?
+1. Log Lambda errors to CloudWatch
+2. Create an alarm for error messages
 
 * Constrained concurrency
 
@@ -292,6 +295,16 @@ Option 2 could simplify retry/back-off
 * Constrained concurrency
 
 Serialize via SQS Queue?
+
+SQS is a Message Queueing system with:
+
+- Best-effort ordering
+- At-least-once delivery
+- Dead-letter queues
+- Multi-producer, multi-consumer
+- ACK of processed messages
+
+* Constrained concurrency
 
 CloudWatch Event Rule → SQS Queue → Lambda
 
@@ -309,7 +322,7 @@ Serialize via SQS Queue?
 
 No event source for SQS 😭
 
-.image images/no.jpg 200 _
+.image images/not-found.jpg 400 _
 
 * Constrained concurrency
 
@@ -341,24 +354,38 @@ CloudWatch Event Rule → SNS Topic → SQS Queue
 
 Serialize via Kinesis Streams?
 
-- One consumer per shard (no global lock!)
+AWS Kinesis Data Streams are:
+
+- Persistent, sharded stream of "records"
+- Progressed with client "cursors"
+- Cleaned up after some retention period
+
+* Constrained concurrency
+
+CloudWatch Event Rule → Kinesis Stream → Lambda
+
+- One consumer per shard (no lock needed!)
 - Guaranteed delivery (with limited retention)
 - Built-in retry/back-off
 - Errors are blocking...
 
+.image images/build-it.jpg 400 _
+
 * Kinesis+Lambda
 
-CloudWatch Event Rule → Kinesis Stream → Lambda
+Let's build it
 
-- Publish Lambda Function
+- Publish new Lambda Function
 - Create Kinesis Stream w/ shard count
 - Create Event Source Mapping from Kinesis Stream to Lambda Function
 - Create CloudWatch Event Rule with EC2 event source
 - Add Kinesis Stream as an Event Target
 
-.image images/build-it.jpg 400 _
-
 * Kinesis+Lambda
+
+New event data model!
+
+CloudWatch events are batched as a list of Kinesis Records
 
     {
         "Records": [
@@ -373,6 +400,8 @@ CloudWatch Event Rule → Kinesis Stream → Lambda
 
 For each record, data is the EC2 CloudWatch event, encoded as Base64!
 
+: rewrite out lambda???
+
 * Kinesis+Lambda
 
     def KinesisStreamHandler(lambda_handler):
@@ -386,16 +415,19 @@ For each record, data is the EC2 CloudWatch event, encoded as Base64!
 
             for record in event['Records']:
                 data = b64decode(record['kinesis']['data'])
-                revent = loads(data)
+                cw_event = loads(data)
 
                 # call wrapped handler
-                lambda_handler(revent, context)
+                lambda_handler(cw_event, context)
 
             return {
                 'message': 'Processed {} records'.format(len(event['Records']))
             }
 
         return handler
+
+    # wrap it!
+    stream_handler = KinesisStreamHandler(state_change_handler)
 
 * Potential issues
 
@@ -443,5 +475,8 @@ Maybe, raise an alarm if event state is stale.
 
 * Final thoughts
 
+- Guaranteed delivery _to_ Kinesis?
 - Ordering?
 - Accidental termination?
+
+.image images/thinky-face.jpg 600 _
